@@ -42,3 +42,29 @@ test('DNS uses edge-compatible manual redirects and falls back safely',async()=>
  };
  try{const result=await extractMetadata('https://www.tiktok.com/@chef/video/123');assert.equal(result.title,'Recipe');assert.equal(fallback,true)}finally{globalThis.fetch=original}
 });
+test('short TikTok URLs resolve through owned redirects without reading video HTML',async()=>{
+ const original=globalThis.fetch;
+ try{for(const host of ['vm.tiktok.com','vt.tiktok.com']){
+  const calls=[];globalThis.fetch=async(url)=>{
+   const value=String(url);calls.push(value);
+   if(value.includes('dns-query'))return Response.json({Status:0,Answer:[{type:1,data:'8.8.8.8'}]});
+   if(value.includes('/oembed?'))return Response.json({title:'A recipe',author_name:'Chef',thumbnail_url:'https://example.com/thumb.jpg',html:'<script>ignored</script>'});
+   if(value===`https://${host}/abc/`)return new Response(null,{status:302,headers:{location:'https://www.tiktok.com/@chef/video/123?share=1'}});
+   throw new Error('Video HTML must not be fetched');
+  };
+  const result=await extractMetadata(`https://${host}/abc/`);
+  assert.equal(result.url,'https://www.tiktok.com/@chef/video/123');assert.equal(result.originalUrl,`https://${host}/abc/`);
+  assert.ok(calls.includes('https://www.tiktok.com/oembed?url='+encodeURIComponent(result.url)));
+ }}finally{globalThis.fetch=original}
+});
+test('TikTok rejects off-domain and insecure redirects before following',async()=>{
+ const original=globalThis.fetch;
+ try{for(const destination of ['https://example.com/post','https://tiktok.com.evil.com/post','http://www.tiktok.com/@a/video/1']){
+  const calls=[];globalThis.fetch=async(url)=>{calls.push(String(url));return String(url).includes('dns-query')?Response.json({Status:0,Answer:[{type:1,data:'8.8.8.8'}]}):new Response(null,{status:302,headers:{location:destination}})};
+  await assert.rejects(extractMetadata('https://vm.tiktok.com/abc/'));assert.equal(calls.includes(destination),false);
+ }}finally{globalThis.fetch=original}
+});
+test('unavailable TikTok posts explain screenshot fallback',async()=>{
+ const original=globalThis.fetch;globalThis.fetch=async(url)=>String(url).includes('dns-query')?Response.json({Status:0,Answer:[{type:1,data:'8.8.8.8'}]}):new Response(null,{status:403});
+ try{await assert.rejects(extractMetadata('https://www.tiktok.com/@a/video/1'),/private, deleted, age-restricted/)}finally{globalThis.fetch=original}
+});

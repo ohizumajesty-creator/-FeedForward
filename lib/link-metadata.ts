@@ -61,23 +61,38 @@ async function checkDns(url: URL, signal: AbortSignal) {
   if (!addresses.length || addresses.some(ip => !publicAddress(ip))) throw new LinkError("Local and private-network links are not allowed.");
 }
 const isHost = (url: URL, host: string) => url.hostname === host || url.hostname.endsWith(`.${host}`);
-async function safePage(initial: URL, signal: AbortSignal): Promise<{ response: Response; url: URL }> {
+export const TIKTOK_ACCESS_ERROR = "We couldn’t access this TikTok post. It may be private, deleted, age-restricted, or unavailable. Upload a screenshot instead.";
+function tikTokUrl(url: URL): URL {
+  const safe = publicUrl(url.href);
+  if (!isHost(safe, "tiktok.com")) throw new LinkError("TikTok redirects must stay on TikTok HTTPS domains. Upload a screenshot instead.");
+  return safe;
+}
+function videoUrl(url: URL): URL | null {
+  if (!isHost(url, "tiktok.com") || !/^\/@[^/]+\/video\/\d+\/?$/.test(url.pathname)) return null;
+  const canonical = new URL(url.href); canonical.search = ""; canonical.hash = "";
+  return canonical;
+}
+async function safePage(initial: URL, signal: AbortSignal, tikTokOnly = false, resolveVideo = false): Promise<{ response: Response; url: URL }> {
   let url = initial;
   for (let hop = 0; hop < 5; hop++) {
+    if (tikTokOnly) tikTokUrl(url);
     await checkDns(url, signal);
+    if (resolveVideo && videoUrl(url)) return { response: new Response(null), url: videoUrl(url)! };
     // Workers' public fetch transport is used, never a VPC/service binding or a local socket.
     const response = await fetch(url.href, { redirect: "manual", signal, headers: { accept: "text/html,application/json", "user-agent": "FeedForward/1.0 (public metadata preview)" } }).catch(() => { throw new LinkError("The server couldn’t establish a secure connection to this page. Try again or upload a screenshot."); });
     if ([301,302,303,307,308].includes(response.status)) {
       const location = response.headers.get("location"); await response.body?.cancel();
       if (!location) throw new LinkError(ACCESS_ERROR);
-      url = publicUrl(new URL(location, url).href); continue;
+      url = publicUrl(new URL(location, url).href);
+      if (tikTokOnly) tikTokUrl(url);
+      continue;
     }
     if (!response.ok) { await response.body?.cancel(); throw new LinkError(ACCESS_ERROR); }
     return { response, url };
   }
   throw new LinkError(ACCESS_ERROR);
 }
-export type LinkMetadata = { title: string; description: string; author: string; image: string; url: string };
+export type LinkMetadata = { title: string; description: string; author: string; image: string; url: string; originalUrl?: string };
 export async function extractMetadata(raw: string): Promise<LinkMetadata> {
   const initial = publicUrl(raw);
   const controller = new AbortController();
@@ -85,16 +100,25 @@ export async function extractMetadata(raw: string): Promise<LinkMetadata> {
   const signal = controller.signal;
   let stage = "fetch";
   try {
-    let target = initial;
-    if (isHost(initial, "tiktok.com") && !initial.pathname.includes("/video/")) {
-      const resolved = await safePage(initial, signal); await resolved.response.body?.cancel(); target = resolved.url;
-      if (!isHost(target, "tiktok.com")) throw new LinkError(ACCESS_ERROR);
-    }
-    if (isHost(target, "tiktok.com")) {
-      const { response } = await safePage(publicUrl(`https://www.tiktok.com/oembed?url=${encodeURIComponent(target.href)}`), signal);
-      const data = JSON.parse(await limitedText(response, signal)) as Record<string, unknown>;
-      if (typeof data.title !== "string" || !data.title.trim()) throw new LinkError(ACCESS_ERROR);
-      return { title: data.title.slice(0, 4000), description: "", author: typeof data.author_name === "string" ? data.author_name.slice(0, 500) : "", image: imageUrl(data.thumbnail_url, target), url: target.href };
+    const target = initial;
+    if (isHost(initial, "tiktok.com")) {
+      try {
+        let finalUrl = videoUrl(initial);
+        if (!finalUrl) {
+          const resolved = await safePage(initial, signal, true, true);
+          await resolved.response.body?.cancel();
+          finalUrl = videoUrl(resolved.url);
+        }
+        if (!finalUrl) throw new LinkError(TIKTOK_ACCESS_ERROR);
+        const { response } = await safePage(publicUrl(`https://www.tiktok.com/oembed?url=${encodeURIComponent(finalUrl.href)}`), signal, true);
+        const data: unknown = JSON.parse(await limitedText(response, signal));
+        if (!data || typeof data !== "object" || !("title" in data) || typeof data.title !== "string" || !data.title.trim()) throw new LinkError(TIKTOK_ACCESS_ERROR);
+        const post = data as Record<string, unknown>;
+        return { title: data.title.slice(0, 4000), description: "", author: typeof post.author_name === "string" ? post.author_name.slice(0, 500) : "", image: imageUrl(post.thumbnail_url, finalUrl), url: finalUrl.href, originalUrl: initial.href };
+      } catch (error) {
+        if (error instanceof LinkError && error.message !== ACCESS_ERROR) throw error;
+        throw new LinkError(TIKTOK_ACCESS_ERROR);
+      }
     }
     const { response, url } = await safePage(target, signal);
     if (!response.headers.get("content-type")?.includes("text/html")) { await response.body?.cancel(); throw new LinkError("This link isn’t a public web page. Upload a screenshot instead."); }
